@@ -407,30 +407,34 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
    * @return the container iff found
    */
   def takePrewarmContainer(action: ExecutableWhiskAction): Option[(ActorRef, ContainerData)] = {
-    val kind = action.exec.kind
-    val memory = action.limits.memory.megabytes.MB
-    val now = Deadline.now
-    prewarmedPool.toSeq
-      .sortBy(_._2.expires.getOrElse(now))
-      .find {
-        case (_, PreWarmedData(_, `kind`, `memory`, _, _)) => true
-        case _                                             => false
-      }
-      .map {
-        case (ref, data) =>
-          // Move the container to the usual pool
-          freePool = freePool + (ref -> data)
-          prewarmedPool = prewarmedPool - ref
-          // Create a new prewarm container
-          // NOTE: prewarming ignores the action code in exec, but this is dangerous as the field is accessible to the
-          // factory
+    if (action.annotations.isTruthy("cxlfork")) {
+      None
+    } else {
+      val kind = action.exec.kind
+      val memory = action.limits.memory.megabytes.MB
+      val now = Deadline.now
+      prewarmedPool.toSeq
+        .sortBy(_._2.expires.getOrElse(now))
+        .find {
+          case (_, PreWarmedData(_, `kind`, `memory`, _, _)) => true
+          case _                                             => false
+        }
+        .map {
+          case (ref, data) =>
+            // Move the container to the usual pool
+            freePool = freePool + (ref -> data)
+            prewarmedPool = prewarmedPool - ref
+            // Create a new prewarm container
+            // NOTE: prewarming ignores the action code in exec, but this is dangerous as the field is accessible to the
+            // factory
 
-          //get the appropriate ttl from prewarm configs
-          val ttl =
-            prewarmConfig.find(pc => pc.memoryLimit == memory && pc.exec.kind == kind).flatMap(_.reactive.map(_.ttl))
-          prewarmContainer(action.exec, memory, ttl)
-          (ref, data)
-      }
+            //get the appropriate ttl from prewarm configs
+            val ttl =
+              prewarmConfig.find(pc => pc.memoryLimit == memory && pc.exec.kind == kind).flatMap(_.reactive.map(_.ttl))
+            prewarmContainer(action.exec, memory, ttl)
+            (ref, data)
+        }
+    }
   }
 
   /** Removes a container and updates state accordingly. */

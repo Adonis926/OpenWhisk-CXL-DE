@@ -22,9 +22,11 @@ import org.apache.commons.lang3.SystemUtils
 import org.apache.openwhisk.common.{Logging, TransactionId}
 import org.apache.openwhisk.core.{ConfigKeys, WhiskConfig}
 import org.apache.openwhisk.core.containerpool.{Container, ContainerFactory, ContainerFactoryProvider}
-import org.apache.openwhisk.core.entity.{ByteSize, ExecManifest, InvokerInstanceId}
+import org.apache.openwhisk.core.containerpool.cxlfork.{CxlporterContainer, CxlporterContainerConfig}
+import org.apache.openwhisk.core.entity.{ByteSize, ExecManifest, ExecutableWhiskAction, InvokerInstanceId}
 import pureconfig._
 import pureconfig.generic.auto._
+import spray.json.DefaultJsonProtocol._
 
 import scala.collection.concurrent.TrieMap
 import scala.concurrent.{ExecutionContext, Future}
@@ -60,6 +62,42 @@ class StandaloneDockerContainerFactory(instance: InvokerInstanceId, parameters: 
     extends DockerContainerFactory(instance, parameters) {
   private val pulledImages = new TrieMap[String, Boolean]()
   private val factoryConfig = loadConfigOrThrow[StandaloneDockerConfig](ConfigKeys.standaloneDockerContainerFactory)
+  private val cxlporterConfig = loadConfigOrThrow[CxlporterContainerConfig]("whisk.cxlporter")
+
+  override def createContainer(
+    tid: TransactionId,
+    name: String,
+    actionImage: ExecManifest.ImageName,
+    userProvidedImage: Boolean,
+    memory: ByteSize,
+    cpuShares: Int,
+    cpuLimit: Option[Double],
+    action: Option[ExecutableWhiskAction])(implicit config: WhiskConfig, logging: Logging): Future[Container] = {
+    action match {
+      case Some(executable) if cxlporterConfig.enabled && executable.annotations.isTruthy("cxlfork") =>
+        val owner = executable.annotations.getAs[String]("cxlfork-owner").toOption.getOrElse("paper")
+        val function =
+          executable.annotations.getAs[String]("cxlfork-function").toOption.getOrElse(executable.name.asString)
+        val capsuleVersion =
+          executable.annotations.getAs[String]("cxlfork-version").toOption.getOrElse("v1")
+        logging.info(
+          this,
+          s"creating source-integrated CXLP/2 container action=${executable.name} " +
+            s"identity=$owner/$function/$capsuleVersion endpoint=${cxlporterConfig.host}:${cxlporterConfig.port}")
+        Future.successful(
+          new CxlporterContainer(
+            org.apache.openwhisk.core.containerpool.ContainerId(name),
+            cxlporterConfig.host,
+            cxlporterConfig.port,
+            cxlporterConfig.connectTimeout,
+            cxlporterConfig.requestTimeout,
+            owner,
+            function,
+            capsuleVersion))
+      case _ =>
+        createContainer(tid, name, actionImage, userProvidedImage, memory, cpuShares, cpuLimit)
+    }
+  }
 
   override def createContainer(
     tid: TransactionId,
