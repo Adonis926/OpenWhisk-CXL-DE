@@ -545,6 +545,43 @@ class ContainerProxyTests
     }
   }
 
+  it should "destroy a container after an action annotated bench-force-cold" in within(timeout) {
+    val coldAction = action.copy(annotations = Parameters("bench-force-cold", JsBoolean(true)))
+    val container = new TestContainer
+    val factory = createFactory(Future.successful(container))
+    val acker = createAcker(coldAction)
+    val store = createStore
+    val collector = createCollector()
+    val machine = childActorOf(
+      ContainerProxy.props(
+        factory,
+        acker,
+        store,
+        collector,
+        InvokerInstanceId(0, userMemory = defaultUserMemory),
+        poolConfig,
+        healthchecksConfig(),
+        pauseGrace = pauseGrace))
+
+    registerCallback(machine)
+    machine ! Run(coldAction, message)
+    expectMsg(Transition(machine, Uninitialized, Running))
+    expectMsg(ContainerRemoved(true))
+    expectMsg(Transition(machine, Running, Removing))
+
+    awaitAssert {
+      container.initializeCount shouldBe 1
+      container.runCount shouldBe 1
+      container.destroyCount shouldBe 1
+      acker.calls should have size 1
+      acker.calls.head._2.annotations.get("benchForceCold") shouldBe Some(JsBoolean(true))
+      acker.calls.head._2.annotations.get("benchContainerCreateNs") should not be empty
+      acker.calls.head._2.annotations.get("benchInitNs") should not be empty
+      acker.calls.head._2.annotations.get("benchRunNs") should not be empty
+      store.calls should have size 1
+    }
+  }
+
   it should "not collect logs if the log-limit is set to 0" in within(timeout) {
     val noLogsAction = action.copy(limits = ActionLimits(logs = LogLimit(0.MB)))
 

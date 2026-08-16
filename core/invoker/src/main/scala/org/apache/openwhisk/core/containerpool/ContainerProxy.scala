@@ -301,6 +301,7 @@ class ContainerProxy(factory: (TransactionId,
     case Event(job: Run, _) =>
       implicit val transid = job.msg.transid
       activeCount += 1
+      val containerCreateStarted = System.nanoTime()
       // create a new container
       val container = factory(
         job.msg.transid,
@@ -348,7 +349,7 @@ class ContainerProxy(factory: (TransactionId,
         }
         .flatMap { container =>
           // now attempt to inject the user code and run the action
-          initializeAndRun(container, job)
+          initializeAndRun(container, job, benchContainerCreateNs = Some(System.nanoTime() - containerCreateStarted))
             .map(_ => RunCompleted)
         }
         .pipeTo(self)
@@ -421,8 +422,17 @@ class ContainerProxy(factory: (TransactionId,
     case Event(RunCompleted, data: WarmedData) =>
       activeCount -= 1
       val newData = data.withoutResumeRun()
-      //if there are items in runbuffer, process them if there is capacity, and stay; otherwise if we have any pending activations, also stay
-      if (requestWork(data) || activeCount > 0) {
+      if (data.action.annotations.isTruthy("bench-force-cold")) {
+        logging.info(this, s"bench-force-cold removing container ${data.container} after activation")
+        rejectBuffered()
+        if (activeCount == 0) {
+          destroyContainer(newData, true)
+        } else {
+          rescheduleJob = true
+          goto(Removing) using newData
+        }
+      } else if (requestWork(data) || activeCount > 0) {
+        // If there are buffered or active requests, keep the reusable path.
         stay using newData
       } else {
         goto(Ready) using newData
@@ -773,8 +783,11 @@ class ContainerProxy(factory: (TransactionId,
    * @return a future completing after logs have been collected and
    *         added to the WhiskActivation
    */
-  def initializeAndRun(container: Container, job: Run, reschedule: Boolean = false)(
-    implicit tid: TransactionId): Future[WhiskActivation] = {
+  def initializeAndRun(
+    container: Container,
+    job: Run,
+    reschedule: Boolean = false,
+    benchContainerCreateNs: Option[Long] = None)(implicit tid: TransactionId): Future[WhiskActivation] = {
     val actionTimeout = job.action.limits.timeout.duration
     val unlockedArgs =
       ContainerProxy.unlockArguments(job.msg.content, job.msg.lockedArgs, ParameterEncryption.singleton)
@@ -846,7 +859,9 @@ class ContainerProxy(factory: (TransactionId,
                 initInterval,
                 initRunInterval,
                 runInterval.duration >= actionTimeout,
-                response)
+                response,
+                benchContainerCreateNs,
+                Some(runInterval.duration.toNanos))
           }
       }
       .recoverWith {
@@ -1043,7 +1058,9 @@ object ContainerProxy {
                                initInterval: Option[Interval],
                                totalInterval: Interval,
                                isTimeout: Boolean,
-                               response: ActivationResponse) = {
+                               response: ActivationResponse,
+                               benchContainerCreateNs: Option[Long] = None,
+                               benchRunNs: Option[Long] = None) = {
     val causedBy = if (job.msg.causedBySequence) {
       Some(Parameters(WhiskActivation.causedByAnnotation, JsString(Exec.SEQUENCE)))
     } else None
@@ -1056,6 +1073,14 @@ object ContainerProxy {
     val initTime = {
       initInterval.map(initTime => Parameters(WhiskActivation.initTimeAnnotation, initTime.duration.toMillis.toJson))
     }
+
+    val benchCreate =
+      benchContainerCreateNs.map(value => Parameters("benchContainerCreateNs", JsString(value.toString)))
+    val benchInit = initInterval.map(value => Parameters("benchInitNs", JsString(value.duration.toNanos.toString)))
+    val benchRun = benchRunNs.map(value => Parameters("benchRunNs", JsString(value.toString)))
+    val benchCold = if (job.action.annotations.isTruthy("bench-force-cold")) {
+      Some(Parameters("benchForceCold", JsBoolean(true)))
+    } else None
 
     val binding =
       job.msg.action.binding.map(f => Parameters(WhiskActivation.bindingAnnotation, JsString(f.asString)))
@@ -1076,7 +1101,8 @@ object ContainerProxy {
           Parameters(WhiskActivation.pathAnnotation, JsString(job.action.fullyQualifiedName(false).asString)) ++
           Parameters(WhiskActivation.kindAnnotation, JsString(job.action.exec.kind)) ++
           Parameters(WhiskActivation.timeoutAnnotation, JsBoolean(isTimeout)) ++
-          causedBy ++ initTime ++ waitTime ++ binding
+          causedBy ++ initTime ++ waitTime ++ binding ++
+          benchCreate ++ benchInit ++ benchRun ++ benchCold
       })
   }
 
